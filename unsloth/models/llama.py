@@ -75,6 +75,20 @@ except:
     from huggingface_hub.utils._token import get_token
 pass
 from triton import __version__ as triton_version
+try:
+    from transformers.models.falcon_h1.modeling_falcon_h1 import (
+        FalconHybridMambaAttentionDynamicCache,
+    )
+except:
+    transformers_version = Version(transformers_version)
+    if not transformers_version >= Version("4.50.3"): #TODO: Update when transformers is updated
+        raise ImportError(
+            f"Unsloth: Your transformers version of {transformers_version} does not support FalconH1.\n"\
+            f"The minimum required version is 4.50.3.\n"\
+            f'Try `pip install --upgrade "transformers>=4.50.3"`\n'\
+            f"to obtain the latest transformers build, then restart this session."\
+        )
+    pass
 HAS_XFORMERS = xformers is not None
 BlockDiagonalCausalMask = xformers.attn_bias.BlockDiagonalCausalMask if HAS_XFORMERS else None
 
@@ -101,6 +115,7 @@ SDPA_HAS_GQA = "enable_gqa" in scaled_dot_product_attention.__doc__
 # Fix new HF's inference code
 def _fast_prepare_inputs_for_generation(self, input_ids, **kwargs,):
     past_key_values = kwargs.get("past_key_values", None)
+
     if past_key_values is not None:
         # Check for uninitialized DynamicCache
         if len(past_key_values) == 0:
@@ -227,6 +242,7 @@ def LlamaAttention_fast_forward_inference(
     RH_Q[:,:,:,:h] = Qn[:,:,:,h:]
     RH_Q[:,:,:,h:] = Qn[:,:,:,:h]
     RH_Q[:,:,:,:h].neg_() # torch.neg(RH_Q[:,:,:,:h], out = RH_Q[:,:,:,:h])
+    import ipdb; ipdb.set_trace()
     Qn *= cos
     Qn.addcmul_(RH_Q, sin)
 
@@ -601,8 +617,7 @@ def LlamaModel_fast_forward(
     output_hidden_states: Optional[bool] = None,
     return_dict:          Optional[bool] = None,
     *args, **kwargs,
-) -> Union[Tuple, BaseModelOutputWithPast]:
-    
+) -> Union[Tuple, BaseModelOutputWithPast]:   
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     assert(output_attentions is False)
     output_hidden_states = (
@@ -677,8 +692,28 @@ def LlamaModel_fast_forward(
     IS_GRANITE = self.config.model_type.startswith("granite")
     IS_FALCON_H1 = self.config.model_type.startswith("falcon_h1")
 
+    cache_position = kwargs.get("cache_position", None)
+
     if IS_FALCON_H1:
         inputs_embeds = inputs_embeds * self.config.embedding_multiplier
+
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = FalconHybridMambaAttentionDynamicCache(
+                    self.config,
+                    input_ids.shape[0],
+                    self.dtype,
+                    devices=[
+                        self.layers[i].mamba.conv1d.weight.device for i in range(self.config.num_hidden_layers)
+                    ],
+                )
+
+            cache_position = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length,
+                dtype  = torch.int32,
+                device = "cuda:0",
+            )
+            cache_position = cache_position.unsqueeze(0).view(-1, seq_length)
 
     train_embed_tokens = self.embed_tokens.weight.requires_grad
 
@@ -853,8 +888,12 @@ def LlamaModel_fast_forward(
     for idx, decoder_layer in enumerate(self.layers):
 
         if output_hidden_states: all_hidden_states += (hidden_states,)
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
 
+        if not IS_FALCON_H1:
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+        else:
+            past_key_value = past_key_values
+        
         mask = causal_mask
         if IS_GEMMA2:
             if (idx % 2 == 0):
@@ -891,6 +930,7 @@ def LlamaModel_fast_forward(
                 use_cache           = use_cache,
                 padding_mask        = padding_mask,
                 position_embeddings = position_embeddings,
+                cache_position=cache_position,
             )
             hidden_states = layer_outputs[0]
         pass

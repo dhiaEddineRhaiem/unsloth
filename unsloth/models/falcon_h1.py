@@ -97,8 +97,10 @@ def FalconH1Attention_fast_forward(
     K = K.transpose(1, 2)
 
     kv_seq_len = K.shape[-2]
-    if past_key_value is not None:
+    if past_key_value is not None and q_len == 1:
         kv_seq_len += past_key_value[0].shape[-2]
+    # elif past_key_value is not None and q_len != 1:
+    #     kv_seq_len += q_len
 
     if position_embeddings:
         cos, sin = position_embeddings
@@ -115,10 +117,9 @@ def FalconH1Attention_fast_forward(
     Q, K = fast_rope_embedding(Q, K, cos, sin)
 
     if past_key_value is not None:
-        K = torch.cat([past_key_value[0], K], dim = 2)
-        V = torch.cat([past_key_value[1], V], dim = 2)
+        K, V = past_key_value.update(K, V, self.layer_idx)
     pass
-    past_key_value = (K, V) if use_cache else None
+    past_key_value = past_key_value if use_cache else None
 
     # Attention module
     if (not HAS_FLASH_ATTENTION and attention_mask is None):
@@ -215,7 +216,7 @@ def FalconH1Attention_fast_forward_inference(
     """
     Xn = hidden_states
     bsz, _, hd = hidden_states.size()
-    K1, V1 = past_key_value
+    K1, V1 = past_key_value[self.layer_idx]
     dtype = Xn.dtype
 
     n_heads    = self.config.num_attention_heads
@@ -298,6 +299,9 @@ def FalconH1Attention_fast_forward_inference(
     # New KV cache
     # Kn = torch.cat([K1, Kn], dim = 2)
     # Vn = torch.cat([V1, Vn], dim = 2)
+    if past_key_value is not None:
+        _ = past_key_value.update(Kn, Vn, self.layer_idx)
+
     self.paged_attention_K[seq_len] = Kn.permute(2, 0, 1, 3)
     self.paged_attention_V[seq_len] = Vn.permute(2, 0, 1, 3)
     Kn = self.paged_attention_K[:kv_seq_len].permute(1, 2, 0, 3)
@@ -343,7 +347,7 @@ def FalconH1Attention_fast_forward_inference(
     A = A.transpose(1, 2)
     A = A.reshape(bsz, 1, attention_size)
     A = fast_linear_forward(self.o_proj, A, out = self.temp_O)
-    return A, (Kn, Vn)
+    return A, past_key_value
 pass
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/falcon_h1/modeling_falcon_h1.py
@@ -411,7 +415,6 @@ def FalconH1DecoderLayer_fast_forward(
     else:
         residual = hidden_states
         hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
-
         mamba_hidden_states = self.mamba(
             hidden_states=hidden_states,
             cache_params=past_key_value,
@@ -451,7 +454,7 @@ def FalconH1DecoderLayer_fast_forward(
     return outputs
 pass
 
-def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconAttention_fast_forward_inference, mlp_fast_forward_inference=fast_swiglu_inference):
+def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconH1Attention_fast_forward_inference, mlp_fast_forward_inference=fast_swiglu_inference):
     # This makes the attention and MLP customisable.
     # Now for models like qwen3 or cohere which use custom attention operations, we can use this function
     def FalconH1Model_fast_forward_inference_custom(
@@ -482,8 +485,7 @@ def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconAtte
         variance = torch.empty((bsz, q_len, 1), dtype = torch.float32, device = "cuda:0")
         temp_mlp = torch.empty((2, bsz, 1, mlp_size), dtype = X.dtype, device = "cuda:0")
         temp_gate, temp_up = temp_mlp[0], temp_mlp[1]
-        import pdb; pdb.set_trace()
-        seq_len = past_key_values[0][0].shape[-2]
+        seq_len = past_key_values[0][0][0].shape[-2]
         if bsz != 1:
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
                 attention_mask,
@@ -519,7 +521,7 @@ def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconAtte
             mamba_hidden_states = decoder_layer.mamba(
                 hidden_states=X,
                 cache_params=present_key_value,
-                cache_position=cache_position,
+                cache_position=position_ids,
                 attention_mask=mamba_attention_mask,
             )
             mamba_hidden_states = mamba_hidden_states * decoder_layer.ssm_out_multiplier
@@ -577,36 +579,15 @@ def _fast_prepare_inputs_for_generation(
     **kwargs,):
     # Overwitten -- has a unique cache type, `FalconHybridMambaAttentionDynamicCache`
     empty_past_kv = past_key_values is None
-    
-    # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
-    # Exception 1: when passing input_embeds, input_ids may be missing entries
-    # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
-    # Exception 3: with synced GPUs cache_position may go out of bounds, but we only want dummy token in that case.
-    #              (we can't check exception 3 while compiling)
-    if not empty_past_kv:
-        if (
-            inputs_embeds is not None  # Exception 1
-            or (is_torchdynamo_compiling() or cache_position[-1] >= input_ids.shape[1])  # Exception 3
-        ):
-            input_ids = input_ids[:, -cache_position.shape[0] :]
-        elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
-            input_ids = input_ids[:, cache_position]
-    else:
-        past_key_values = FalconHybridMambaAttentionDynamicCache(
-            self.config,
-            input_ids.shape[0],
-            self.dtype,
-            devices=[
-                self.model.layers[i].mamba.conv1d.weight.device for i in range(self.config.num_hidden_layers)
-            ],
-        )
 
-    if attention_mask is not None and position_ids is None:
-        # create position_ids on the fly for batch generation
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        if not empty_past_kv:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
+    if not empty_past_kv:
+        if cache_position is not None:
+            cache_position = cache_position[-1, None]
+
+        input_ids = input_ids[:, cache_position]
+
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, cache_position]
 
     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
     if inputs_embeds is not None and empty_past_kv:
@@ -616,7 +597,7 @@ def _fast_prepare_inputs_for_generation(
 
     model_inputs.update(
         {
-            "position_ids": position_ids,
+            "position_ids": cache_position,
             "past_key_values": past_key_values,
             "use_cache": use_cache,
             "attention_mask": attention_mask,

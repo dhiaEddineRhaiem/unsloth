@@ -511,15 +511,15 @@ def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconH1At
             )
             attention_hidden_states, present_key_value = attention_fast_forward_inference(
                 decoder_layer.self_attn,
-                hidden_states = X,
+                hidden_states = X * self.config.attention_in_multiplier,
                 past_key_value = past_key_values[idx],
                 position_ids = position_ids,
                 attention_mask = attention_mask,
                 do_prefill = not hasattr(decoder_layer.self_attn, "paged_attention"),
             )
-            attention_hidden_states = attention_hidden_states * decoder_layer.attention_in_multiplier
+            attention_hidden_states = attention_hidden_states * self.config.attention_out_multiplier
             mamba_hidden_states = decoder_layer.mamba(
-                hidden_states=X,
+                hidden_states=X * self.config.ssm_in_multiplier,
                 cache_params=present_key_value,
                 cache_position=position_ids,
                 attention_mask=mamba_attention_mask,
@@ -528,8 +528,8 @@ def _FalconH1_fast_forward_inference(attention_fast_forward_inference=FalconH1At
             X = mamba_hidden_states + attention_hidden_states
 
             X += residual
-
             residual.copy_(X) # residual = X
+            
             X = fast_rms_layernorm_inference(
                 decoder_layer.pre_ff_layernorm,
                 X,
